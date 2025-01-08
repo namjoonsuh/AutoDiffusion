@@ -2,14 +2,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
-#import process_edited as pce
-import process_GQ as pce
+import process_edited as pce
+#import process_GQ as pce
 
 import tqdm
 import gc
 import random
 import pandas as pd
 import matplotlib.pyplot as plt
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 def _make_mlp_layers(num_units):
     layers = nn.ModuleList([
@@ -63,8 +65,12 @@ class DeapStack(nn.Module):
             outputs['nums'] = before_threshold
             
             for col in range(len(num_min_values)):
-                outputs['nums'][:,col] = torch.where(before_threshold[:,col] < num_min_values[col], num_min_values[col], before_threshold[:,col])     
-                outputs['nums'][:,col] = torch.where(before_threshold[:,col] > num_max_values[col], num_max_values[col], before_threshold[:,col]) 
+                outputs['nums'][:,col] = torch.where(before_threshold[:,col] < num_min_values[col], 
+                                                     num_min_values[col], 
+                                                     before_threshold[:,col])     
+                outputs['nums'][:,col] = torch.where(before_threshold[:,col] > num_max_values[col], 
+                                                     num_max_values[col], 
+                                                     before_threshold[:,col]) 
                                                      
         return outputs
 
@@ -74,8 +80,9 @@ class DeapStack(nn.Module):
     def decoder(self, latent_feature, num_min_values, num_max_values):
         decoded_outputs = dict()
 
+        x = latent_feature
         for layer in self.decoders:
-            x = F.relu(layer(latent_feature))
+            x = F.relu(layer(x))
         last_hidden_layer = x
         
         if self.bins_linear:
@@ -89,8 +96,12 @@ class DeapStack(nn.Module):
             decoded_outputs['nums'] = d_before_threshold
             
             for col in range(len(num_min_values)):
-                decoded_outputs['nums'][:,col] = torch.where(d_before_threshold[:,col] < num_min_values[col], num_min_values[col], d_before_threshold[:,col])     
-                decoded_outputs['nums'][:,col] = torch.where(d_before_threshold[:,col] > num_max_values[col], num_max_values[col], d_before_threshold[:,col]) 
+                decoded_outputs['nums'][:,col] = torch.where(d_before_threshold[:,col] < num_min_values[col], 
+                                                             num_min_values[col], 
+                                                             d_before_threshold[:,col])     
+                decoded_outputs['nums'][:,col] = torch.where(d_before_threshold[:,col] > num_max_values[col], 
+                                                             num_max_values[col], 
+                                                             d_before_threshold[:,col]) 
                 
         return decoded_outputs
 
@@ -101,8 +112,7 @@ def auto_loss(inputs, reconstruction, n_bins, n_nums, n_cats, cards):
         CE for categoricals.
         MSE for numericals.
         reconstruction loss is weighted average of mean reduction of loss per datatype.
-        mask loss is mean reduced.
-        final loss is weighted sum of reconstruction loss and mask loss.
+        final loss is the mean of these reconstruction losses.
     """
     bins = inputs[:,0:n_bins]
     cats = inputs[:,n_bins:n_bins+n_cats]
@@ -128,58 +138,73 @@ def auto_loss(inputs, reconstruction, n_bins, n_nums, n_cats, cards):
 
 def sigmoid_threshold(logits):
     sigmoid_output = torch.sigmoid(logits)
-    threshold_output = torch.where(sigmoid_output > 0.5, torch.tensor(1), torch.tensor(0))
+    threshold_output = torch.where(sigmoid_output > 0.5, torch.tensor(1, device=device), torch.tensor(0, device=device))
     return threshold_output
 
 def softmax_with_max(predictions):
     # Applying softmax function
     probabilities = F.softmax(predictions, dim=1)
-    
     # Getting the index of the maximum element
     max_indices = torch.argmax(probabilities, dim=1)
-    
     return max_indices
 
 def train_autoencoder(df, hidden_size, num_layers, lr, weight_decay, n_epochs, batch_size, threshold):
+    # Parse data on CPU (usually not a performance bottleneck)
     parser = pce.DataFrameParser().fit(df, threshold)
-    data = parser.transform()
-    data = torch.tensor(data.astype('float32'))
+    data_np = parser.transform()
+    
+    # Convert to torch and move data to GPU if available
+    data = torch.tensor(data_np.astype('float32')).to(device)
 
+    # Get counts for various data types
     datatype_info = parser.datatype_info()
-    n_bins = datatype_info['n_bins']; n_cats = datatype_info['n_cats']
-    n_nums = datatype_info['n_nums']; cards = datatype_info['cards']
+    n_bins = datatype_info['n_bins']
+    n_cats = datatype_info['n_cats']
+    n_nums = datatype_info['n_nums']
+    cards = datatype_info['cards']
 
-    DS = DeapStack(n_bins, n_cats, n_nums, cards, data.shape[1], hidden_size=128, bottleneck_size=data.shape[1], num_layers=3)
+    # Initialize model and move it to GPU
+    DS = DeapStack(
+        n_bins, n_cats, n_nums, cards, 
+        in_features=data.shape[1], 
+        hidden_size=hidden_size, 
+        bottleneck_size=data.shape[1], 
+        num_layers=num_layers
+    ).to(device)
 
     optimizer = Adam(DS.parameters(), lr=lr, weight_decay=weight_decay)
 
     tqdm_epoch = tqdm.notebook.trange(n_epochs)
-
     losses = []
-    batch_size
+    
+    # Prepare index list for random sampling
     all_indices = list(range(data.shape[0]))
 
     for epoch in tqdm_epoch:
-      batch_indices = random.sample(all_indices, batch_size)
+        # Sample a batch of indices
+        batch_indices = random.sample(all_indices, batch_size)
+        batch_data = data[batch_indices, :]  # already on the correct device
 
-      output = DS(data[batch_indices,:])
+        # Forward pass
+        output = DS(batch_data)
 
-      l2_loss = auto_loss(data[batch_indices,:], output, n_bins, n_nums, n_cats, cards)
-      optimizer.zero_grad()
-      l2_loss.backward()
-      optimizer.step()
+        # Compute loss
+        l2_loss = auto_loss(batch_data, output, n_bins, n_nums, n_cats, cards)
+        
+        # Backprop
+        optimizer.zero_grad()
+        l2_loss.backward()
+        optimizer.step()
 
-      gc.collect()
-      torch.cuda.empty_cache()
-
-      # Print the training loss over the epoch.
-      losses.append(l2_loss.item())
-
-      tqdm_epoch.set_description('Average Loss: {:5f}'.format(l2_loss.item()))
+        # Log the training loss
+        losses.append(l2_loss.item())
+        tqdm_epoch.set_description('Average Loss: {:5f}'.format(l2_loss.item()))
     
-    num_min_values, _ = torch.min(data[:,n_bins+n_cats:n_bins+n_cats+n_nums], dim=0)
-    num_max_values, _ = torch.max(data[:,n_bins+n_cats:n_bins+n_cats+n_nums], dim=0)
+    # Compute min/max values for numeric columns over entire dataset
+    num_min_values, _ = torch.min(data[:, n_bins+n_cats:n_bins+n_cats+n_nums], dim=0)
+    num_max_values, _ = torch.max(data[:, n_bins+n_cats:n_bins+n_cats+n_nums], dim=0)
 
+    # Extract latent features and decode (both operations on GPU)
     latent_features = DS.featurize(data)
     output = DS.decoder(latent_features, num_min_values, num_max_values)
 

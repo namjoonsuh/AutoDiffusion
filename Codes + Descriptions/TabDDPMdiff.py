@@ -1,11 +1,10 @@
 import functools
 import torch
 import torch.nn as nn
+import torch.nn.functional as F  # For reglu and geglu definitions if used
 import numpy as np
 import tqdm.notebook
 import random
-import math
-import torch.nn as nn
 import math
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union, cast
 from torch import Tensor
@@ -14,10 +13,11 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import OneCycleLR
 from scipy import integrate
 
-device = 'cuda'  #@param ['cuda', 'cpu'] {'type':'string'}
+################################################################################
+# Dynamically choose device
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 torch.cuda.empty_cache()
 
-###########################################################################################################################################
 ModuleType = Union[str, Callable[..., nn.Module]]
 
 class SiLU(nn.Module):
@@ -27,17 +27,15 @@ class SiLU(nn.Module):
 def timestep_embedding(timesteps, dim, max_period=10000):
     """
     Create sinusoidal timestep embeddings.
-
-    :param timesteps: a 1-D Tensor of N indices, one per batch element.
-                      These may be fractional.
+    :param timesteps: a 1-D Tensor of N indices, one per batch element. Could be fractional.
     :param dim: the dimension of the output.
     :param max_period: controls the minimum frequency of the embeddings.
     :return: an [N x dim] Tensor of positional embeddings.
     """
+    # Ensure timesteps is on the correct device
+    timesteps = timesteps.to(device)
     half = dim // 2
-    freqs = torch.exp(
-        -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-    ).to(device=timesteps.device)
+    freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=device) / half)
     args = timesteps[:, None].float() * freqs[None]
     embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
     if dim % 2:
@@ -51,7 +49,6 @@ def _is_glu_activation(activation: ModuleType):
         or activation in [ReGLU, GEGLU]
     )
 
-
 def _all_or_none(values):
     assert all(x is None for x in values) or all(x is not None for x in values)
 
@@ -64,7 +61,6 @@ def reglu(x: Tensor) -> Tensor:
     a, b = x.chunk(2, dim=-1)
     return a * F.relu(b)
 
-
 def geglu(x: Tensor) -> Tensor:
     """The GEGLU activation function from [1].
     References:
@@ -75,37 +71,10 @@ def geglu(x: Tensor) -> Tensor:
     return a * F.gelu(b)
 
 class ReGLU(nn.Module):
-    """The ReGLU activation function from [shazeer2020glu].
-
-    Examples:
-        .. testcode::
-
-            module = ReGLU()
-            x = torch.randn(3, 4)
-            assert module(x).shape == (3, 2)
-
-    References:
-        * [shazeer2020glu] Noam Shazeer, "GLU Variants Improve Transformer", 2020
-    """
-
     def forward(self, x: Tensor) -> Tensor:
         return reglu(x)
 
-
 class GEGLU(nn.Module):
-    """The GEGLU activation function from [shazeer2020glu].
-
-    Examples:
-        .. testcode::
-
-            module = GEGLU()
-            x = torch.randn(3, 4)
-            assert module(x).shape == (3, 2)
-
-    References:
-        * [shazeer2020glu] Noam Shazeer, "GLU Variants Improve Transformer", 2020
-    """
-
     def forward(self, x: Tensor) -> Tensor:
         return geglu(x)
 
@@ -122,31 +91,11 @@ def _make_nn_module(module_type: ModuleType, *args) -> nn.Module:
         else module_type(*args)
     )
 
-
 class MLP(nn.Module):
-    """The MLP model used in [gorishniy2021revisiting].
-
-    The following scheme describes the architecture:
-
-    .. code-block:: text
-
-          MLP: (in) -> Block -> ... -> Block -> Linear -> (out)
-        Block: (in) -> Linear -> Activation -> Dropout -> (out)
-
-    Examples:
-        .. testcode::
-
-            x = torch.randn(4, 2)
-            module = MLP.make_baseline(x.shape[1], [3, 5], 0.1, 1)
-            assert module(x).shape == (len(x), 1)
-
-    References:
-        * [gorishniy2021revisiting] Yury Gorishniy, Ivan Rubachev, Valentin Khrulkov, Artem Babenko, "Revisiting Deep Learning Models for Tabular Data", 2021
-    """
+    """The MLP model used in [gorishniy2021revisiting]."""
 
     class Block(nn.Module):
         """The main building block of `MLP`."""
-
         def __init__(
             self,
             *,
@@ -173,10 +122,6 @@ class MLP(nn.Module):
         activation: Union[str, Callable[[], nn.Module]],
         d_out: int,
     ) -> None:
-        """
-        Note:
-            `make_baseline` is the recommended constructor.
-        """
         super().__init__()
         if isinstance(dropouts, float):
             dropouts = [dropouts] * len(d_layers)
@@ -205,34 +150,11 @@ class MLP(nn.Module):
         dropout: float,
         d_out: int,
     ) -> 'MLP':
-        """Create a "baseline" `MLP`.
-
-        This variation of MLP was used in [gorishniy2021revisiting]. Features:
-
-        * :code:`Activation` = :code:`ReLU`
-        * all linear layers except for the first one and the last one are of the same dimension
-        * the dropout rate is the same for all dropout layers
-
-        Args:
-            d_in: the input size
-            d_layers: the dimensions of the linear layers. If there are more than two
-                layers, then all of them except for the first and the last ones must
-                have the same dimension. Valid examples: :code:`[]`, :code:`[8]`,
-                :code:`[8, 16]`, :code:`[2, 2, 2, 2]`, :code:`[1, 2, 2, 4]`. Invalid
-                example: :code:`[1, 2, 3, 4]`.
-            dropout: the dropout rate for all hidden layers
-            d_out: the output size
-        Returns:
-            MLP
-
-        References:
-            * [gorishniy2021revisiting] Yury Gorishniy, Ivan Rubachev, Valentin Khrulkov, Artem Babenko, "Revisiting Deep Learning Models for Tabular Data", 2021
-        """
-        assert isinstance(dropout, float)
+        """Create a "baseline" `MLP` with ReLU activations."""
         if len(d_layers) > 2:
             assert len(set(d_layers[1:-1])) == 1, (
-                'if d_layers contains more than two elements, then'
-                ' all elements except for the first and the last ones must be equal.'
+                'If d_layers contains more than two elements, then'
+                ' all elements except for the first and the last must be equal.'
             )
         return MLP(
             d_in=d_in,
@@ -249,35 +171,46 @@ class MLP(nn.Module):
         x = self.head(x)
         return x
 
-###########################################################################################################################################
+################################################################################
 
-# f(x,t)
+# Updated drift_coeff, diffusion_coeff, etc. so they operate on GPU
+
 def drift_coeff(x, t, beta_1, beta_0):
-   t = torch.tensor(t)
-   beta_t = beta_0 + t * (beta_1 - beta_0)
-   drift = -0.5 * beta_t * x
-   return drift
+    # ensure t is on same device as x
+    if not torch.is_tensor(t):
+        t = torch.tensor(t, device=x.device)
+    else:
+        t = t.to(x.device)
+    beta_t = beta_0 + t * (beta_1 - beta_0)
+    drift = -0.5 * beta_t * x
+    return drift
 
-# g(t)
 def diffusion_coeff(t, beta_1, beta_0):
-    t = torch.tensor(t)
+    if not torch.is_tensor(t):
+        t = torch.tensor(t, device=device)
+    else:
+        t = t.to(device)
     beta_t = beta_0 + t * (beta_1 - beta_0)
     diffusion = torch.sqrt(beta_t)
     return diffusion
 
 def marginal_prob_mean(x, t, beta_1, beta_0):
-  #x = x.to(device)
-  t = torch.tensor(t)
-  log_mean_coeff = -0.25 * t ** 2 * (beta_1 - beta_0) - 0.5 * t * beta_0
-  mean = torch.exp(log_mean_coeff)[:, None] * x
-  return mean
+    if not torch.is_tensor(t):
+        t = torch.tensor(t, device=x.device)
+    else:
+        t = t.to(x.device)
+    log_mean_coeff = -0.25 * t ** 2 * (beta_1 - beta_0) - 0.5 * t * beta_0
+    mean = torch.exp(log_mean_coeff)[:, None] * x
+    return mean
 
 def marginal_prob_std(t, beta_1, beta_0):
-  t = torch.tensor(t)
-  log_mean_coeff = -0.25 * t ** 2 * (beta_1 - beta_0) - 0.5 * t * beta_0
-  std = 1 - torch.exp(2. * log_mean_coeff)
-  return torch.sqrt(std)
-
+    if not torch.is_tensor(t):
+        t = torch.tensor(t, device=device)
+    else:
+        t = t.to(device)
+    log_mean_coeff = -0.25 * t ** 2 * (beta_1 - beta_0) - 0.5 * t * beta_0
+    std = 1 - torch.exp(2. * log_mean_coeff)
+    return torch.sqrt(std)
 
 drift_coeff_fn = functools.partial(drift_coeff, beta_1=20, beta_0=0.1)
 diffusion_coeff_fn = functools.partial(diffusion_coeff, beta_1=20, beta_0=0.1)
@@ -285,53 +218,57 @@ marginal_prob_mean_fn = functools.partial(marginal_prob_mean, beta_1=20, beta_0=
 marginal_prob_std_fn = functools.partial(marginal_prob_std, beta_1=20, beta_0=0.1)
 
 def min_max_scaling(factor, scale=(0, 1)):
-
-  std = (factor - factor.min()) / (factor.max() - factor.min())
-  new_min = torch.tensor(scale[0])
-  new_max = torch.tensor(scale[1])
-  return std * (new_max - new_min) + new_min
-
+    factor = factor.to(device)
+    std = (factor - factor.min()) / (factor.max() - factor.min())
+    new_min = torch.tensor(scale[0], device=device)
+    new_max = torch.tensor(scale[1], device=device)
+    return std * (new_max - new_min) + new_min
 
 def compute_v(ll, alpha, beta):
+    v = -torch.ones(ll.shape, device=ll.device)
+    v[torch.gt(ll, beta)] = 0.
+    v[torch.le(ll, alpha)] = 1.
 
-    v = -torch.ones(ll.shape).to(ll.device)
-    v[torch.gt(ll, beta)] = torch.tensor(0., device=v.device)
-    v[torch.le(ll, alpha)] = torch.tensor(1., device=v.device)
-
-    if ll[torch.eq(v, -1)].shape[0] !=0 and ll[torch.eq(v, -1)].shape[0] !=1 :
-        v[torch.eq(v, -1)] = min_max_scaling(ll[torch.eq(v, -1)], scale=(1, 0)).to(v.device)
+    mask = torch.eq(v, -1)
+    if mask.sum() not in [0, 1]:
+        v[mask] = min_max_scaling(ll[mask], scale=(1, 0)).to(v.device)
     else:
-        v[torch.eq(v, -1)] = torch.tensor(0.5, device=v.device)
+        v[mask] = 0.5
     return v
 
-
 def loss_fn(model, Input_Data, T, eps=1e-5):
-    N, input_dim = Input_Data.shape  
-    loss_values = torch.empty(N)
-    
-    for row in range(N):
-        random_t = torch.rand(T) * (1. - eps) + eps
-        
-        # Compute Perturbed data from SDE
-        mean = marginal_prob_mean_fn(Input_Data[row,:], random_t).to(device)
-        std = marginal_prob_std_fn(random_t).to(device)
-        z = torch.randn(T, input_dim).to(device)
-        perturbed_data = mean + z * std[:, None]
-        
-        score = model(perturbed_data, random_t).to(device)
-        loss_row = torch.mean(torch.sum((score * std[:,None] + z)**2, dim=1))
-        
-        loss_values[row] = loss_row
-    return loss_values.to(device)
+    """
+    model: the score model (on device)
+    Input_Data: [N, input_dim], already on device
+    T: number of time steps
+    """
+    N, input_dim = Input_Data.shape
+    loss_values = torch.empty(N, device=Input_Data.device)
 
+    for row in range(N):
+        # Random times on GPU
+        random_t = torch.rand(T, device=Input_Data.device) * (1. - eps) + eps
+
+        # Compute Perturbed data from SDE
+        mean = marginal_prob_mean_fn(Input_Data[row, :], random_t)
+        std = marginal_prob_std_fn(random_t)
+        z = torch.randn(T, input_dim, device=Input_Data.device)
+        perturbed_data = mean + z * std[:, None]
+
+        score = model(perturbed_data, random_t)
+        loss_row = torch.mean(torch.sum((score * std[:, None] + z) ** 2, dim=1))
+        loss_values[row] = loss_row
+
+    return loss_values
 
 class MLPDiffusion(nn.Module):
-    def __init__(self, d_in, rtdl_params, dim_t = 128):
+    def __init__(self, d_in, rtdl_params, dim_t=128):
         super().__init__()
         self.dim_t = dim_t
 
-        rtdl_params['d_in'] = dim_t
-        rtdl_params['d_out'] = d_in
+        # Adjust RTDL MLP parameters to produce an output of dimension d_in
+        rtdl_params['d_in'] = dim_t  # input dimension for MLP
+        rtdl_params['d_out'] = d_in  # output dimension from MLP
 
         self.mlp = MLP.make_baseline(**rtdl_params)
         
@@ -343,24 +280,39 @@ class MLPDiffusion(nn.Module):
         )
     
     def forward(self, x, timesteps):
+        """
+        x: [batch_size, d_in]
+        timesteps: [batch_size] (or [T]) - time steps
+        """
+        # embed time
         emb = self.time_embed(timestep_embedding(timesteps, self.dim_t))
+        # project input + add time embedding
         x = self.proj(x) + emb
         return self.mlp(x)
 
+def train_diffusion(latent_features, T, eps, sigma, lr,
+                    num_batches_per_epoch, maximum_learning_rate,
+                    weight_decay, n_epochs, batch_size):
+    """
+    :param latent_features: data to train on. Make sure it's a tensor.
+    :param T: number of time steps in loss_fn
+    :param eps: small epsilon for random_t
+    :param sigma: unused in this snippet, but presumably for noise scaling
+    ...
+    """
+    # 1) Move the data to the chosen device
+    latent_features = latent_features.to(device)
 
-def train_diffusion(latent_features, T, eps, sigma, lr, \
-                    num_batches_per_epoch, maximum_learning_rate, weight_decay, n_epochs, batch_size):
-    
-    rtdl_params={
-        'd_in': latent_features.shape[1],
-        'd_layers': [256,256],
+    # 2) Create the model and place it on the GPU
+    rtdl_params = {
+        'd_in': latent_features.shape[1],  # Overwritten in MLPDiffusion init
+        'd_layers': [256, 256],
         'dropout': 0.0,
-        'd_out': latent_features.shape[1],
+        'd_out': latent_features.shape[1]  # Overwritten in MLPDiffusion init
     }
         
     ScoreNet = MLPDiffusion(latent_features.shape[1], rtdl_params)
-    ScoreNet_Parallel = torch.nn.DataParallel(ScoreNet)
-    ScoreNet_Parallel = ScoreNet_Parallel.to(device)
+    ScoreNet_Parallel = torch.nn.DataParallel(ScoreNet).to(device)
 
     optimizer = Adam(ScoreNet_Parallel.parameters(), lr=lr, weight_decay=weight_decay)
     lr_scheduler = OneCycleLR(
@@ -374,22 +326,26 @@ def train_diffusion(latent_features, T, eps, sigma, lr, \
     losses = []
     
     for epoch in tqdm_epoch:
-      batch_idx = random.choices(range(latent_features.shape[0]), k=batch_size)  ## Choose random indices 
-      batch_X = latent_features[batch_idx,:]  
-      
-      loss_values = loss_fn(ScoreNet_Parallel, batch_X, T, eps)
-      loss = torch.mean(loss_values)
-    
-      optimizer.zero_grad()
-      loss.backward() 
-      optimizer.step()
-      lr_scheduler.step()
+        # Sample a random batch
+        batch_idx = random.choices(range(latent_features.shape[0]), k=batch_size)
+        batch_X = latent_features[batch_idx, :]
 
-      # Print the training loss over the epoch.
-      losses.append(loss.item())
-      tqdm_epoch.set_description('Average Loss: {:5f}'.format(loss.item()))
+        # Compute the loss for this batch
+        loss_values = loss_fn(ScoreNet_Parallel, batch_X, T, eps)
+        loss = torch.mean(loss_values)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        lr_scheduler.step()
+
+        # Record/log the training loss
+        losses.append(loss.item())
+        tqdm_epoch.set_description('Average Loss: {:5f}'.format(loss.item()))
         
-    return ScoreNet
+    # Return the trained model. If you want a single-GPU model, you can un-wrap DataParallel:
+    # ScoreNet_Parallel.module
+    return ScoreNet_Parallel
 
 def Euler_Maruyama_sampling(model, T, N, P, device):
     time_steps = torch.linspace(1., 1e-5, T) 

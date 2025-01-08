@@ -1,0 +1,28 @@
+Magic : https://www.kaggle.com/datasets/abhinand05/magic-gamma-telescope-dataset?resource=download
+Churn Modeling : https://www.kaggle.com/datasets/shrutimechlearn/churn-modelling?resource=download
+wilt : https://www.openml.org/search?type=data&sort=runs&id=40983&status=active
+India Liver Patient : https://www.kaggle.com/datasets/uciml/indian-liver-patient-records?resource=download
+Absent : https://www.kaggle.com/datasets/tonypriyanka2913/employee-absenteeism
+Shoppers : https://www.kaggle.com/datasets/henrysue/online-shoppers-intention
+
+
+1. Regression
+ - Insurance
+ - Absent
+ - Beijing
+ - News
+
+2. Binary Class
+ - wilt
+ - Magic
+ - adult
+ - Churn_Modelling
+ - HTRU_2
+ - Titanic
+
+3. Multi Class
+ - Obesity 
+ - Nursery
+ - Faults
+ - Abalone
+ - Bean

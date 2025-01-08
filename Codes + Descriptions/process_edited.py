@@ -6,6 +6,8 @@ import pandas as pd
 
 __all__ = ['StandardScaler', 'LabelEncoder', 'FreqLabelEncoder', 'DataFrameParser', 'SingleDataset']
 
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
 class StandardScaler(object):
     def __init__(self):
         self.loc = None
@@ -269,8 +271,8 @@ def convert_to_table(org_df, gen_output, threshold):
         for idx in range(n_bins):
             bin_tensor[:,idx] = sigmoid_threshold(gen_output['bins'][:,idx]).detach().to(torch.int64)
 
-    syn_data = torch.cat((bin_tensor, cat_tensor, num_tensor), dim=1)
-    t_np = syn_data.numpy() #convert to Numpy array
+    syn_data = torch.cat((bin_tensor.to(device), cat_tensor.to(device), num_tensor.to(device)), dim=1)
+    t_np = syn_data.to('cpu').numpy() #convert to Numpy array
     syn_df = pd.DataFrame(t_np)
     syn_df.columns = parser_conv.column_name()
     syn_df = parser_conv.invert_fit(syn_df)

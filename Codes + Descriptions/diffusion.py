@@ -9,82 +9,91 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import OneCycleLR
 from scipy import integrate
 
-device = 'cuda'  #@param ['cuda', 'cpu'] {'type':'string'}
+# Choose the device (GPU if available, else CPU)
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 torch.cuda.empty_cache()
 
 # f(x,t)
 def drift_coeff(x, t, beta_1, beta_0):
-   t = torch.tensor(t)
-   beta_t = beta_0 + t * (beta_1 - beta_0)
-   drift = -0.5 * beta_t * x
-   return drift
+    t = torch.tensor(t, device=x.device)  # Ensure 't' is on the same device as 'x'
+    beta_t = beta_0 + t * (beta_1 - beta_0)
+    drift = -0.5 * beta_t * x
+    return drift
 
 # g(t)
 def diffusion_coeff(t, beta_1, beta_0):
-    t = torch.tensor(t)
+    # This is often used with random_t on device:
+    t = torch.tensor(t, device=device) if not torch.is_tensor(t) else t
     beta_t = beta_0 + t * (beta_1 - beta_0)
     diffusion = torch.sqrt(beta_t)
     return diffusion
 
 def marginal_prob_mean(x, t, beta_1, beta_0):
-  #x = x.to(device)
-  t = torch.tensor(t)
-  log_mean_coeff = -0.25 * t ** 2 * (beta_1 - beta_0) - 0.5 * t * beta_0
-  mean = torch.exp(log_mean_coeff)[:, None] * x
-  return mean
+    # Make sure 't' is a tensor on the same device as 'x'
+    t = torch.tensor(t, device=x.device) if not torch.is_tensor(t) else t.to(x.device)
+    log_mean_coeff = -0.25 * t ** 2 * (beta_1 - beta_0) - 0.5 * t * beta_0
+    mean = torch.exp(log_mean_coeff)[:, None].to(device) * x
+    return mean
 
 def marginal_prob_std(t, beta_1, beta_0):
-  t = torch.tensor(t)
-  log_mean_coeff = -0.25 * t ** 2 * (beta_1 - beta_0) - 0.5 * t * beta_0
-  std = 1 - torch.exp(2. * log_mean_coeff)
-  return torch.sqrt(std)
+    t = torch.tensor(t, device=device) if not torch.is_tensor(t) else t
+    log_mean_coeff = -0.25 * t ** 2 * (beta_1 - beta_0) - 0.5 * t * beta_0
+    std = 1 - torch.exp(2. * log_mean_coeff)
+    return torch.sqrt(std)
 
-
+# Partialed versions
 drift_coeff_fn = functools.partial(drift_coeff, beta_1=20, beta_0=0.1)
 diffusion_coeff_fn = functools.partial(diffusion_coeff, beta_1=20, beta_0=0.1)
 marginal_prob_mean_fn = functools.partial(marginal_prob_mean, beta_1=20, beta_0=0.1)
 marginal_prob_std_fn = functools.partial(marginal_prob_std, beta_1=20, beta_0=0.1)
 
 def min_max_scaling(factor, scale=(0, 1)):
-
-  std = (factor - factor.min()) / (factor.max() - factor.min())
-  new_min = torch.tensor(scale[0])
-  new_max = torch.tensor(scale[1])
-  return std * (new_max - new_min) + new_min
-
+    # Factor is assumed to be on the correct device already
+    std = (factor - factor.min()) / (factor.max() - factor.min())
+    new_min = torch.tensor(scale[0], device=factor.device)
+    new_max = torch.tensor(scale[1], device=factor.device)
+    return std * (new_max - new_min) + new_min
 
 def compute_v(ll, alpha, beta):
+    # Assumes ll is already on the correct device
+    v = -torch.ones(ll.shape, device=ll.device)
+    v[torch.gt(ll, beta)] = 0.0
+    v[torch.le(ll, alpha)] = 1.0
 
-  v = -torch.ones(ll.shape).to(ll.device)
-  v[torch.gt(ll, beta)] = torch.tensor(0., device=v.device)
-  v[torch.le(ll, alpha)] = torch.tensor(1., device=v.device)
-
-  if ll[torch.eq(v, -1)].shape[0] !=0 and ll[torch.eq(v, -1)].shape[0] !=1 :
-        v[torch.eq(v, -1)] = min_max_scaling(ll[torch.eq(v, -1)], scale=(1, 0)).to(v.device)
-  else:
-        v[torch.eq(v, -1)] = torch.tensor(0.5, device=v.device)
-  return v
-
+    # If there are intermediate values, apply scaling
+    if ll[torch.eq(v, -1)].shape[0] not in [0, 1]:
+        v[torch.eq(v, -1)] = min_max_scaling(ll[torch.eq(v, -1)], scale=(1, 0)).to(ll.device)
+    else:
+        v[torch.eq(v, -1)] = 0.5
+    return v
 
 def loss_fn(model, Input_Data, T, eps=1e-5):
-    N, input_dim = Input_Data.shape  
-    loss_values = torch.empty(N)
+    """
+    model: the score model (on device)
+    Input_Data: [N, input_dim], already on device
+    T: number of time steps
+    """
+    N, input_dim = Input_Data.shape
+    # Allocate memory for loss values on the correct device
+    loss_values = torch.empty(N, device=Input_Data.device)
     
     for row in range(N):
-        random_t = torch.rand(T) * (1. - eps) + eps
+        # random_t on GPU
+        random_t = torch.rand(T, device=Input_Data.device) * (1. - eps) + eps
         
         # Compute Perturbed data from SDE
-        mean = marginal_prob_mean_fn(Input_Data[row,:], random_t).to(device)
-        std = marginal_prob_std_fn(random_t).to(device)
-        z = torch.randn(T, input_dim).to(device)
+        mean = marginal_prob_mean_fn(Input_Data[row,:], random_t)
+        std = marginal_prob_std_fn(random_t)
+        
+        z = torch.randn(T, input_dim, device=Input_Data.device)
         perturbed_data = mean + z * std[:, None]
         
-        score = model(perturbed_data, random_t).to(device)
-        loss_row = torch.mean(torch.sum((score * std[:,None] + z)**2, dim=1))
+        # Model and computations already on GPU
+        score = model(perturbed_data, random_t)
+        loss_row = torch.mean(torch.sum((score * std[:, None] + z) ** 2, dim=1))
         
         loss_values[row] = loss_row
-    return loss_values.to(device)
-
+    return loss_values
 
 class ConcatSquash(nn.Module):
     def __init__(self, input_dim, output_dim):
@@ -94,7 +103,10 @@ class ConcatSquash(nn.Module):
         self.hyper_gate = nn.Linear(1, output_dim, bias=False)
 
     def forward(self, x, t):
-        return self.linear_h(x) * torch.sigmoid(self.hyper_bias(t.view(-1,1)) + self.hyper_gate(t.view(-1,1)))
+        # x, t are assumed to be on the same device
+        return self.linear_h(x) * torch.sigmoid(
+            self.hyper_bias(t.view(-1,1)) + self.hyper_gate(t.view(-1,1))
+        )
 
 class TabNetwork(nn.Module):
     def __init__(self, hidden_dims, converted_table_dim):
@@ -103,21 +115,25 @@ class TabNetwork(nn.Module):
         self.hidden_dims = hidden_dims
         self.converted_table_dim = converted_table_dim
         
-        modules = []                                                            
-        dim = self.converted_table_dim                                              
-        
-        for item in list(self.hidden_dims):                                          
-          modules.append(ConcatSquash(dim, dim + item))                           
-          dim = dim + item                                                           
-          modules.append(nn.ELU())                                             
+        modules = []
+        dim = self.converted_table_dim
+                                                  
+        for item in list(self.hidden_dims):
+            modules.append(ConcatSquash(dim, dim + item))
+            dim = dim + item
+            modules.append(nn.ELU())
 
-        modules.append(nn.Linear(dim, self.converted_table_dim))                     
-        self.all_modules = nn.ModuleList(modules)                              
+        modules.append(nn.Linear(dim, self.converted_table_dim))
+        self.all_modules = nn.ModuleList(modules)
+        
+        # We'll still reference the partial from above
         self.marginal_prob_std_fn = marginal_prob_std_fn
 
     def forward(self, x, t):
+        # x on device, t on device
         modules = self.all_modules
-        temb = x; time = t;
+        temb = x
+        time = t
         m_idx = 0
         
         for _ in range(len(self.hidden_dims)):
@@ -125,19 +141,34 @@ class TabNetwork(nn.Module):
             m_idx += 1
             temb = modules[m_idx](temb1)
             m_idx += 1
-            
+        
         h = modules[m_idx](temb)
-        score_net = h/self.marginal_prob_std_fn(t)[:,None]
-            
+        # Divide output by std to get final score
+        score_net = h / self.marginal_prob_std_fn(time)[:, None]
         return score_net
-    
-def train_diffusion(latent_features, T, hidden_dims, converted_table_dim, eps, sigma, lr, \
-                    num_batches_per_epoch, maximum_learning_rate, weight_decay, n_epochs, batch_size):
-    
-    ScoreNet = TabNetwork(hidden_dims, converted_table_dim) # Stasy Architecture
-    ScoreNet_Parallel = torch.nn.DataParallel(ScoreNet)
-    ScoreNet_Parallel = ScoreNet_Parallel.to(device)
 
+def train_diffusion(
+    latent_features,
+    T,
+    hidden_dims,
+    converted_table_dim,
+    eps,
+    sigma,
+    lr,
+    num_batches_per_epoch,
+    maximum_learning_rate,
+    weight_decay,
+    n_epochs,
+    batch_size
+):
+    # 1) Move the data to the chosen device
+    latent_features = latent_features.to(device)
+
+    # 2) Create the model and place it on the GPU
+    ScoreNet = TabNetwork(hidden_dims, converted_table_dim)
+    ScoreNet_Parallel = torch.nn.DataParallel(ScoreNet).to(device)
+
+    # 3) Create optimizer and scheduler
     optimizer = Adam(ScoreNet_Parallel.parameters(), lr=lr, weight_decay=weight_decay)
     lr_scheduler = OneCycleLR(
         optimizer,
@@ -149,36 +180,32 @@ def train_diffusion(latent_features, T, hidden_dims, converted_table_dim, eps, s
     tqdm_epoch = tqdm.notebook.trange(n_epochs)
     losses = []
     
-    #alpha0 = 0.25
-    #beta0 = 0.95
-    
     for epoch in tqdm_epoch:
-      batch_idx = random.choices(range(latent_features.shape[0]), k=batch_size)  ## Choose random indices 
-      batch_X = latent_features[batch_idx,:]  
-      
-      loss_values = loss_fn(ScoreNet_Parallel, batch_X, T, eps)
-      
-      #q_alpha = torch.tensor(alpha0 + torch.log( torch.tensor(1+0.0001718*epoch* (1-alpha0), dtype=torch.float32))).clamp_(max=1).to(device)
-      #q_beta = torch.tensor(beta0 + torch.log( torch.tensor(1+0.0001718*epoch* (1-beta0), dtype=torch.float32) )).clamp_(max=1).to(device)
-
-      #alpha = torch.quantile(loss_values, q_alpha)
-      #beta = torch.quantile(loss_values, q_beta)
-      #assert alpha <= beta
-      #v = compute_v(loss_values, alpha, beta)      
-      
-      #loss = torch.mean(v*loss_values)
-      loss = torch.mean(loss_values)
-    
-      optimizer.zero_grad()
-      loss.backward() 
-      optimizer.step()
-      lr_scheduler.step()
-
-      # Print the training loss over the epoch.
-      losses.append(loss.item())
-      tqdm_epoch.set_description('Average Loss: {:5f}'.format(loss.item()))
+        # Sample a random batch on device
+        batch_idx = random.choices(range(latent_features.shape[0]), k=batch_size)
+        batch_X = latent_features[batch_idx, :]
         
-    return ScoreNet
+        # Calculate the loss
+        loss_values = loss_fn(ScoreNet_Parallel, batch_X, T, eps)
+        
+        # If you wanted to do robust Q-loss or similar, you'd do so here:
+        # alpha = torch.quantile(loss_values, some_q).to(device)
+        # beta = torch.quantile(loss_values, some_other_q).to(device)
+        # v = compute_v(loss_values, alpha, beta)
+        # loss = torch.mean(v*loss_values)
+        
+        loss = torch.mean(loss_values)
+    
+        optimizer.zero_grad()
+        loss.backward() 
+        optimizer.step()
+        lr_scheduler.step()
+
+        # Print/record the training loss
+        losses.append(loss.item())
+        tqdm_epoch.set_description('Average Loss: {:5f}'.format(loss.item()))
+        
+    return ScoreNet_Parallel
 
 def Euler_Maruyama_sampling(model, T, N, P, device):
     time_steps = torch.linspace(1., 1e-5, T) 
